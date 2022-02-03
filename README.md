@@ -4,7 +4,7 @@ This repository contains the code and results presented in the preprint article 
 
 ## Summary
 
-We present a novel tensor-network-based Q-learning framework (QMPS) for controlling 1d spin chains. As an exemplary task we consider the problem of ground state preparation and prepare different states of the paradigmatic mixed-field Ising model. In order to reach large system sizes, we simulate the spin chain using matrix product states (MPS). The control problem is solved using reinforcement learning, specifically deep Q-learning. As an ansatz, we employ a hybrid MPS+NN network that is especially designed for controlling a large number of spins/qubits. 
+We present a novel Q-learning framework (QMPS) specifically designed for controlling 1d spin chains in which the RL agent is represented by a combination of a matrix product state (MPS) and a neural network (NN). The algorithm can be used to find optimal control protocols that prepare a target (ground) state starting from a set of initial states, and as an example we implement the paradigmatic mixed-field Ising model. To reach system sizes which lie beyond exact simulation techniques, we employ matrix product states as a representation for the quantum state and as a trainable machine learning ansatz. The hybrid MPS+NN architecture is then optimized via backpropagation and conventional gradient descent in accordance with the typical DQN algorithm.
 
 ## Content
 
