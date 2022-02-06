@@ -1,10 +1,10 @@
 # Self-Correcting Quantum Many-Body Control using Reinforcement Learning with Tensor Networks
 
-This repository contains the code and results presented in the preprint article [arXiv:2201.11790](https://arxiv.org/abs/2201.11790).
+This repository contains the code and data for the corresponding preprint article [arXiv:2201.11790](https://arxiv.org/abs/2201.11790).
 
 ## Summary
 
-We present a novel Q-learning framework (QMPS) specifically designed for controlling 1d spin chains in which the RL agent is represented by a combination of a matrix product state (MPS) and a neural network (NN). The algorithm can be used to find optimal control protocols that prepare a target (ground) state starting from a set of initial states, and as an example we implement the paradigmatic mixed-field Ising model. To reach system sizes which lie beyond exact simulation techniques, we employ matrix product states as a representation for the quantum state and as a trainable machine learning ansatz. The hybrid MPS+NN architecture is then optimized via backpropagation and conventional gradient descent in accordance with the typical DQN algorithm.
+We present a novel Q-learning framework (QMPS) specifically designed for controlling 1d spin chains in which the RL agent is represented by a combination of a matrix product state (MPS) and a neural network (NN). The algorithm can be used to find optimal control protocols that prepare a target (ground) state starting from a set of initial states, and as an example we implement the paradigmatic mixed-field Ising model. To reach system sizes which lie beyond exact simulation techniques, we employ matrix product states as a representation for the quantum state and as a trainable machine learning ansatz. The hybrid MPS+NN architecture is then optimized via backpropagation and conventional gradient descent.
 
 ## Content
 
