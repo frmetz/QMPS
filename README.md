@@ -25,8 +25,11 @@ __RL environment__
 ## Requirements
 The code is written in Python and apart from the usual libraries (numpy, scipy, matplotlib) you need to have the following packages installed:
 
-* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation.
-* [TensorNetwork](https://github.com/google/TensorNetwork): For the spin chain simulations.
+* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on v0.3.1)
+* [TensorNetwork](https://github.com/google/TensorNetwork): For the spin chain simulations. (tested on v0.4.6)
+
+## Run the code
+Simply download/clone this repo and run `python main.py` from within the [dqn/](dqn/) folder. This will create a folder `results/` where all results of the training are stored (learning curves as plots and as `.npy` files, trained model parameters as a `.pkl` file).
 
 ## Citation
 
