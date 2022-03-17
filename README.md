@@ -25,13 +25,15 @@ __RL environment__
 ## Requirements
 The code is written in Python and apart from the usual libraries (numpy, scipy, matplotlib) you need to have the following packages installed:
 
-* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on v0.3.1)
+* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on jax v0.2.22, jaxlib v0.1.72)
 * [TensorNetwork](https://github.com/google/TensorNetwork): For the spin chain simulations. (tested on v0.4.6)
 
 ## Run the code
 Simply download/clone this repo and run `python main.py` from within the [dqn/](dqn/) folder. This will create a folder `results/` where all results of the training are stored (learning curves as plots and as `.npy` files, trained model parameters as a `.pkl` file).
 
 The run time varies depending on the parameters used. As an example, one full episode of training (including 50 environment and optimization steps) for N=16 spins, a QMPS bond diminesion of 32, a quantum state bond dimension of 16, a feature vector dimension of 32, and a batch size of 64 took 6.5 sec on a Intel Xeon Gold 6230 CPU and 1.8 sec on a NVIDIA Tesla P100 SXM2 GPU.
+
+The demo training script [dqn/main.py](dqn/main.py) shouldn't take longer than ~20min to run.
 
 ## Citation
 
