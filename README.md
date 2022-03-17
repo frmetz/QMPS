@@ -31,6 +31,8 @@ The code is written in Python and apart from the usual libraries (numpy, scipy, 
 ## Run the code
 Simply download/clone this repo and run `python main.py` from within the [dqn/](dqn/) folder. This will create a folder `results/` where all results of the training are stored (learning curves as plots and as `.npy` files, trained model parameters as a `.pkl` file).
 
+The run time varies depending on the parameters used. As an example, one full episode of training (including 50 environment and optimization steps) for N=16 spins, a QMPS bond diminesion of 32, a quantum state bond dimension of 16, a feature vector dimension of 32, and a batch size of 64 took 6.5 sec on a Intel Xeon Gold 6230 CPU and 1.8 sec on a NVIDIA Tesla P100 SXM2 GPU.
+
 ## Citation
 
 If you use our code/models for your research, consider citing our paper:
