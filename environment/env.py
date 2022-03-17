@@ -400,9 +400,9 @@ class SpinChainEnv():
             elif self.random_init_state == InitialState.GroundState:
                 if self.sample_states == None:
                     if not testing:
-                        gx = random.uniform(1.0, 1.5)
-                        gz = random.uniform(0.0, 0.5)
-                        # gz = 0.
+                        gx = random.uniform(1.0, 1.2)
+                        # gz = random.uniform(0.0, 0.5)
+                        gz = 0.
                     # gz = 5e-3 if gx < 1.0 else 0.
                     initial_state_params = dict(J=1.0, gx=gx, gz=gz)
                     if self.library == Library.TN:

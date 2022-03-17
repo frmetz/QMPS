@@ -126,7 +126,7 @@ def train(env, agent, n_episodes, batch_size, eps_init, eps_final, eps_decay, ta
                     best_policy = actions
 
                 if episode % 1 == 0:
-                    print("\nEpisode {}: {:.6f}".format(episode, episode_reward))
+                    print("\nFinal reward {}: {:.6f}".format(episode, reward))
                     print("Elapsed time: {:.6f}".format(time.time() - start_time))
                     # if env.library == environment.Library.TN: norms.append(agent.norm())
                     start_time = time.time()

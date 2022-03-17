@@ -39,10 +39,10 @@ env_params = dict(
 sample_states = None
 init_ents = None
 
-D = 16 # quantum state bond dim
+D = 4 # quantum state bond dim
 full_env_params = dict(
-    initial_state_params = dict(J=0.0, gx=0.0, gz=1.0),
-    final_state_params = dict(J=1.0, gx=1.0, gz=0.0),
+    initial_state_params = dict(J=1.0, gx=1.0, gz=0.0),
+    final_state_params = dict(J=0.0, gx=0.0, gz=1.0),
     seed=seed,
     D=D,
     continuous=False,
