@@ -23,7 +23,7 @@ __RL environment__
 [trained_models/](trained_models/) contains the corresponding data of the control studies presented in the paper (including the optimized QMPS parameters).
 
 ## Requirements
-The code is written in Python and apart from the usual libraries (numpy, scipy, matplotlib) you need to have the following packages installed:
+The code is written in Python and apart from the usual libraries (numpy [tested on v1.21.2], scipy [v1.4.1], matplotlib [v3.1.3]) you need to have the following packages installed:
 
 * [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on jax v0.2.22, jaxlib v0.1.72)
 * [TensorNetwork](https://github.com/google/TensorNetwork): For the spin chain simulations. (tested on v0.4.6)
