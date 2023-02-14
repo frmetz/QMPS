@@ -12,7 +12,6 @@ import numpy as np
 
 import dqn_utils
 import dqn
-import test_random_initial
 sys.path.append('../environment/')
 import env as environment
 
