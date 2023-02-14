@@ -12,13 +12,6 @@ import jax
 # import jax.config
 # jax.config.update("jax_enable_x64", True)
 
-# if os.environ.get('CONDA_DEFAULT_ENV') == 'quspin':
-#     print("Using QuSpin!")
-#     from tlfi_quspin import *
-#     from tlfi_tn import *
-# else:
-#     from tlfi_tn import *
-
 from tlfi_tn import *
 
 
@@ -109,7 +102,7 @@ class SpinChainEnv():
         profiling:          bool
                             when profiling code (needed due to jax's asynchronous dispatch)
         continue_train:     tuple
-                            (model, model_params, env) of trained QMPS agent for multi-state training
+                            (model, model_params, env) of trained QMPS agent for multi-stage training
         seed:               int
                             random seed
         dtype:              str
@@ -131,12 +124,12 @@ class SpinChainEnv():
             final_state_params: tuple = dict(J=0.0, gx=1.0, gz=0.0),
             sample_states: List = None,
             init_ents: List = None,
-            random_complex: bool = False,
+            random_complex: bool = True,
             continuous: bool = False,
-            time_qudit: bool = True,
-            random_initial_state: bool = False,
-            fixed_length_episode: bool = True,
-            reward_at_end: bool = True,
+            time_qudit: bool = False,
+            random_initial_state: bool = True,
+            fixed_length_episode: bool = False,
+            reward_at_end: bool = False,
             reward_function: RewardFunction = RewardFunction.LogFidelity,
             profiling: bool = False,
             continue_train: tuple = None,
@@ -400,7 +393,7 @@ class SpinChainEnv():
             elif self.random_init_state == InitialState.GroundState:
                 if self.sample_states == None:
                     if not testing:
-                        gx = random.uniform(1.0, 1.2)
+                        gx = random.uniform(1.0, 1.1)
                         # gz = random.uniform(0.0, 0.5)
                         gz = 0.
                     # gz = 5e-3 if gx < 1.0 else 0.

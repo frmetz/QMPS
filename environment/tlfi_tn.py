@@ -56,6 +56,7 @@ class TNH():
         self.gz = gz
 
         self.H = FiniteTLFI(L=L, J=J, gx=gx, gz=gz, dtype=self.dtype, backend=self.backend)
+        self.H_numpy = FiniteTLFI(L=L, J=J, gx=gx, gz=gz, dtype=self.dtype, backend="numpy")
 
         self.ground_state_energy = 0
         self.half_sites_entropy = 0.
@@ -76,13 +77,13 @@ class TNH():
             ground state:   FiniteMPS
         """
         if init_state == None:
-            mps = FiniteMPS.random([2] * self.L, [self.D] * (self.L - 1), dtype=self.dtype, backend=self.backend)
+            mps = FiniteMPS.random([2] * self.L, [self.D] * (self.L - 1), dtype=self.dtype, backend="numpy")
         else:
-            mps = FiniteMPS(init_state, canonicalize=True, backend=self.backend)
-        dmrg = FiniteDMRG(mps, self.H)
+            mps = FiniteMPS(init_state, canonicalize=True, backend="numpy")
+        dmrg = FiniteDMRG(mps, self.H_numpy)
         E = dmrg.run_two_site(max_bond_dim=self.D, num_sweeps=200, precision=1E-10, num_krylov_vecs=10, verbose=verbose, delta=1E-10, tol=1E-10, ndiag=10)
         self.ground_state_energy = np.real(E)
-        # print("\n")
+        print("\n")
         return mps
 
     def ground_state(self):

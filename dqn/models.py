@@ -5,475 +5,541 @@ import jax
 # import jax.config
 # jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from jax import jit
+from jax import jit, grad, value_and_grad
 
-def initialize_mps_tensor(d_phys, d_bond1, d_bond2, std=1e-3, boundary=False, norm_factor=1.0, dtype=np.float32):
-    """ Randomly initialize single MPS tensor """
-    if boundary:
-        x = np.zeros((1, d_phys, d_bond1), dtype=dtype)
-        x[:, :, 0] = 1.
-    else:
-        x = np.array(d_phys * [np.eye(d_bond1, d_bond2)], dtype=dtype)
-    x += np.random.normal(0.0, std, size=x.shape)
-    return jnp.array(x) / norm_factor
-
-def initialize_mpo_tensor(d_phys1, d_phys2, d_bond, std=1e-3, boundary=False, norm_factor=1.0, dtype=np.float32):
-    """ Randomly initialize single MPO tensor """
-    if boundary:
-        x = np.zeros((1, d_phys1, d_phys2, d_bond), dtype=dtype)
-        x[:, :, :, 0] = 1
-    else:
-        x = np.array(d_phys1 * [d_phys2 * [np.eye(d_bond)]], dtype=dtype)
-    x += np.random.normal(0.0, std, size=x.shape)
-    return jnp.array(x) / norm_factor
-
-def initialize_nn(scale, layer_sizes):
-    """ Randomly initialize NN """
-    return [(scale * np.random.randn(m, n), scale * np.random.randn(n)) for m, n, in zip(layer_sizes[:-1], layer_sizes[1:])]
+from models_utils import *
 
 
-class QMPS():
-    """
-    Trainable QMPS ansatz (MPS + NN)
+class QMPO(NN):
+    @classmethod
+    def eye(cls, sites, d=2, D=4, feature_dim=12, batch_size=64, share=True, uniform=False, std=0, norm_factor=1., nn=True, layer_sizes=[1], nn_scale=0.1, dtype="complex64", scale=1.0):
+        """ Trainable QMPO ansatz (MPO + NN) """
+        # label position is at center not at zero
+        half_sites = sites // 2
+        tensors_r = init_random_params(feature_dim, 2, D, center=half_sites, d=4, std=std, norm_factor=norm_factor, uniform=uniform, complex=False)
+        tensors_c = init_random_params(feature_dim, 2, D, center=half_sites, d=4, std=std, norm_factor=norm_factor, uniform=uniform, complex=True)
 
-    Parameters:
-        sites:          int
-                        length of spin chain
-        offset:         float
-                        constant to add as offset to QMPS output
-        scale:          float
-                        constant by which QMPS output is scaled
-        sign:           float
-                        which sign should QMPS output have (after log is applied), only important when training without NN
-        nn:             bool
-                        whether to append neural network to QMPS output
-        goal:           bool
-                        true for multi-task RL
-    """
-    def __init__(self, sites, scale=1.0, sign=1.0, offset=0.0, nn=True, goal = False):
-        self.sites = sites
-        self.half_sites = sites // 2
-        self.scale = scale
-        self.sign = sign
-        self.offset = offset
-        self.use_nn = nn
-        self.goal = goal
-        self.eps = 1e-9
+        tensors = [[p1, p2] for p1, p2 in zip(tensors_r, tensors_c)]
+        tensors = normalize(tensors)
 
-    def init_random_params(self, n_labels, d_phys, d_bond, n_times, std=1e-3, norm_factor=1.0, uniform=True):
-        """ Initialize parameter tensor """
-        if uniform:
-            params = [initialize_mps_tensor(d_phys, d_bond, d_bond, std=std, boundary=True, norm_factor=norm_factor)]
-            params += [initialize_mps_tensor(d_phys, d_bond, d_bond, std=std, norm_factor=norm_factor).transpose((1, 0, 2)) for _ in range(self.half_sites-1)]
-            params += [initialize_mps_tensor(n_labels, d_bond, d_bond, std=std, norm_factor=norm_factor).transpose((1, 0, 2))]
-            params += [initialize_mps_tensor(d_phys, d_bond, d_bond, std=std, norm_factor=norm_factor).transpose((1, 0, 2)) for _ in range(self.half_sites-1)]
-            params += [initialize_mps_tensor(d_phys, d_bond, d_bond, std=std, boundary=True, norm_factor=norm_factor).transpose((2, 1, 0))]
+        tensors = [tensors, initialize_nn(nn_scale, layer_sizes)]
+        n_labels = layer_sizes[-1]
+
+        return cls(params=tensors, sites=sites, nn=nn, d=d, D=D, feature_dim=feature_dim, batch_size=batch_size, n_labels=n_labels, share=share, scale=scale)
+
+    @partial(jit, static_argnums=(0,))
+    def get_tensors(self, params_mps):
+        A = []
+        for i,t in enumerate(params_mps):
+            if i == self.half_sites:
+                A.append(t[0])
+                continue
+            X = t[0] + 1.j * t[1]
+            A.append(jnp.einsum('abid,acid->abcd', X, jnp.conj(X))) # Xl, d, d, Xr
+        return A
+
+    @partial(jit, static_argnums=(0,))
+    def predict_single_share(self, params, state_input):
+        """ Contracts the input and parameter MPS <psi|phi> """
+        A = params[0]
+
+        right = jnp.einsum('aijd,bie,cjf->abcdef', A[-1], state_input[-1], jnp.conj(state_input[-1])).squeeze(axis=(3,4,5))
+        for n, a in enumerate(reversed(A[self.half_sites+1:-1])):
+            right = jnp.einsum('ijk, almi, blj, cmk->abc', right, a, state_input[-(n+2)], jnp.conj(state_input[-(n+2)]), optimize='optimal')
+
+        left = jnp.einsum('aijd,bie,cjf->abcdef', A[0], state_input[0], jnp.conj(state_input[0])).squeeze(axis=(0,1,2))
+        for n, a in enumerate(A[1:self.half_sites]):
+            left = jnp.einsum('ijk, ilma, jlb, kmc->abc', left, a, state_input[n+1], jnp.conj(state_input[n+1]), optimize='optimal')
+
+        center = jnp.einsum('bjk, cjk->bc', left, right) # Nt, Xr, Xl
+        z = jnp.einsum('il, ibl->b', center, A[self.half_sites])
+        out = jnp.real(z)
+        if self.use_nn:
+            return self.nn(params[1], out)
         else:
-            D = 2 if 2 <= d_bond else 1
-            params = [initialize_mps_tensor(d_phys, D, D, std=std, boundary=True, norm_factor=norm_factor)]
+            return self.scale * out
 
-            D2 = D
+    # @profile
+    @partial(jit, static_argnums=(0,))
+    def predict_share(self, params, state_input):
+        """ Contracts the input and parameter MPS <psi|phi> over a batch of inputs """
+        Nt, _, d, _ = state_input[0].shape
+        A = params[0]
 
-            for l in range(self.half_sites-2):
-                D1 = 2**(l+1) if 2**(l+1) <= d_bond else d_bond
-                D2 = 2**(l+2) if 2**(l+2) <= d_bond else d_bond
-                params += [initialize_mps_tensor(d_phys, D1, D2, std=std, norm_factor=norm_factor).transpose((1, 0, 2))]
+        right = jnp.einsum('aijd,gbie,gcjf->abcdefg', A[-1], state_input[-1], jnp.conj(state_input[-1]), optimize='optimal').squeeze(axis=(3,4,5))
+        for n, a in enumerate(reversed(A[self.half_sites+1:-1])):
+            right = jnp.einsum('ijkd, almi, dblj, dcmk->abcd', right, a, state_input[-(n+2)], jnp.conj(state_input[-(n+2)]), optimize='optimal')
 
-            params += [initialize_mps_tensor(d_phys, D2, d_bond, std=std, norm_factor=norm_factor).transpose((1, 0, 2))]
-            params += [initialize_mps_tensor(n_labels, d_bond, d_bond, std=std, norm_factor=norm_factor).transpose((1, 0, 2))]
-            params += [initialize_mps_tensor(d_phys, d_bond, D2, std=std, norm_factor=norm_factor).transpose((1, 0, 2))]
+        left = jnp.einsum('aijd,gbie,gcjf->abcdefg', A[0], state_input[0], jnp.conj(state_input[0]), optimize='optimal').squeeze(axis=(0,1,2))
+        for n, a in enumerate(A[1:self.half_sites]):
+            left = jnp.einsum('ijkd, ilma, djlb, dkmc->abcd', left, a, state_input[n+1], jnp.conj(state_input[n+1]), optimize='optimal')
 
-            for l in reversed(range(self.half_sites-2)):
-                D1 = 2**(l+1) if 2**(l+1) <= d_bond else d_bond
-                D2 = 2**(l+2) if 2**(l+2) <= d_bond else d_bond
-                params += [initialize_mps_tensor(d_phys, D2, D1, std=std, norm_factor=norm_factor).transpose((1, 0, 2))]
+        center = jnp.einsum('bjka, cjka->abc', left, right) # Nt, Xr, Xl
+        z = jnp.einsum('ail, ibl->ab', center, A[self.half_sites], optimize='optimal')
+        out = jnp.real(z)
 
-            params += [initialize_mps_tensor(d_phys, D, D, std=std, boundary=True, norm_factor=norm_factor).transpose((2, 1, 0))]
-        return params
+        if self.use_nn:
+            return self.nn(params[1], out)
+        else:
+            return self.scale * out
+
+    # @partial(jit, static_argnums=(0,))
+    def calc_grad(self, g, B):
+        g = jnp.mean(g, axis=0)
+        g = jnp.einsum('bice, bide->bcde', g, B)
+        g_real = 2*jnp.real(g)
+        g_imag = 2*jnp.imag(g)
+        return [g_real, g_imag]
+
+    # @profile
+    # @partial(jit, static_argnums=(0,))
+    def compute_envs(self, A, state_input):
+        right_envs = []
+        right = jnp.einsum('aijd,gbie,gcjf->abcdefg', A[-1], state_input[-1], jnp.conj(state_input[-1]), optimize='optimal').squeeze(axis=(3,4,5))
+        right_envs.append(right) # (Xl, Dl, Dl*, Nt)
+        for n, a in enumerate(reversed(A[self.half_sites+1:-1])):
+            right = jnp.einsum('ijkd, almi, dblj, dcmk->abcd', right, a, state_input[-(n+2)], jnp.conj(state_input[-(n+2)]), optimize='optimal')
+            right_envs.append(right) # (Xl, Dl, Dl*, Nt)
+
+        left_envs = []
+        left = jnp.einsum('aijd,gbie,gcjf->abcdefg', A[0], state_input[0], jnp.conj(state_input[0]), optimize='optimal').squeeze(axis=(0,1,2))
+        left_envs.append(left) # (Nt, X, D)
+        for n, a in enumerate(A[1:self.half_sites]):
+            left = jnp.einsum('ijkd, ilma, djlb, dkmc->abcd', left, a, state_input[n+1], jnp.conj(state_input[n+1]), optimize='optimal')
+            left_envs.append(left) # (Xr, Dr, Dr*, Nt)
+
+        return left_envs, right_envs
+
+    # @profile
+    # @partial(jit, static_argnums=(0,6,7,8), donate_argnums=4)
+    def mpo_grad_step(self, A, params, state_input, env, env2, mode, mode2=None, mode3=None):
+        if mode == 'l':
+            if mode2 == 'center':
+                env = jnp.einsum('icda, abi->abcd', env, A, optimize='optimal') # Nt, D, X, X*
+            else:
+                env = jnp.einsum('akcidj, bijk->abcd', env, A, optimize='optimal') # Nt, D, X, X*
+            if mode3 != 'end':
+                env = jnp.einsum('abij, acdi, aefj->abcdef', env, state_input, jnp.conj(state_input), optimize='optimal')
+                g = jnp.einsum('bija, aeicjd->abcde', env2, env, optimize='optimal')
+            else:
+                g = jnp.einsum('afij, abdi, acej->abcdef', env, state_input, jnp.conj(state_input), optimize='optimal').squeeze(1)
+        elif mode == 'r':
+            if mode2 == 'center':
+                env = jnp.einsum('icda, aib->abcd', env, A, optimize='optimal') # Nt, D, X, X*
+            else:
+                env = jnp.einsum('akcidj, kijb->abcd', env, A, optimize='optimal') # Nt, D, X, X*
+            if mode3 != 'end':
+                env = jnp.einsum('abij, aidc, ajfe->abcdef', env, state_input, jnp.conj(state_input), optimize='optimal')
+                g = jnp.einsum('eija, abicjd->abcde', env2, env, optimize='optimal')
+            else:
+                g = jnp.einsum('abij, aidc, ajfe->acbdfe', env, state_input, jnp.conj(state_input), optimize='optimal').squeeze(1)
+
+        B = params[0] + 1.j * params[1]
+        return self.calc_grad(g, B), env
+
+
+    # @profile
+    # @partial(jit, static_argnums=(0,))
+    def mpo_grad(self, dloss, center, params_mps, tensors, state_input, left_envs, right_envs):
+        grad = []
+        D, _, _ = params_mps[self.half_sites][0].shape
+
+        g = jnp.matmul(center.reshape((self.Nt, D*D, 1)), dloss.reshape((self.Nt, 1, -1))).reshape((self.Nt, D, D, -1)).transpose(0,1,3,2)
+        g2 = jnp.mean(g, axis=0)
+        g_real = jnp.real(g2)
+        g_imag = g_real
+        grad.append([g_real, g_imag])
+
+        ddloss = jnp.dot(dloss.reshape((self.Nt, 1, -1)), params_mps[self.half_sites][0]).squeeze(1) # (Nt, D, D)
+
+        # optimize half_sites-1
+        gg, rightt = self.mpo_grad_step(ddloss, params_mps[self.half_sites-1], state_input[self.half_sites-1], right_envs[-1], left_envs[-2], 'l', mode2='center')
+        grad.append(gg)
+
+        # optimize beginning - half_sites-1
+        for n, tensor in enumerate(reversed(tensors[2:self.half_sites])):
+            gg, rightt = self.mpo_grad_step(tensor, params_mps[self.half_sites-n-2], state_input[self.half_sites-n-2], rightt, left_envs[-(n+3)], 'l')
+            grad.append(gg)
+
+        # optimize beginning
+        gg, rightt = self.mpo_grad_step(tensors[1], params_mps[0], state_input[0], rightt, left_envs[0], 'l', mode3='end')
+        grad.append(gg)
+
+        grad = grad[::-1]
+
+        # optimize half_sites+1
+        gg, leftt = self.mpo_grad_step(ddloss, params_mps[self.half_sites+1], state_input[self.half_sites], left_envs[-1], right_envs[-2], 'r', mode2='center')
+        grad.append(gg)
+
+        # optimize half_sites+2 - end
+        for n, tensor in enumerate(tensors[self.half_sites+1:-2]):
+            gg, leftt = self.mpo_grad_step(tensor, params_mps[self.half_sites+n+2], state_input[self.half_sites+1+n], leftt, right_envs[-(n+3)], 'r')
+            grad.append(gg)
+
+        # optimize end
+        gg, leftt = self.mpo_grad_step(tensors[-2], params_mps[-1], state_input[-1], leftt, left_envs[-1], 'r', mode3='end')
+        grad.append(gg)
+
+        return grad
+
+    @partial(jit, static_argnums=(0,))
+    def loss_nn(self, params, input, labels, actions):
+        preds = self.nn(params, input).reshape((1,-1))
+        preds_select = jnp.take_along_axis(preds, jnp.expand_dims(actions.reshape(1), axis=1), axis=1)
+        return jnp.mean(0.5 * (preds_select.squeeze() - labels)**2)
+
+    # @profile
+    @partial(jit, static_argnums=(0,))
+    def value_and_grad(self, params, tensors, state_input, labels, actions):
+        """ Computes loss function and gradient """
+        Nt, _, d, _ = state_input[0].shape
+        params_mps = params[0]
+        nfeat = params_mps[self.half_sites][0].shape[1]
+        n_labels = self.n_labels
+
+        left_envs, right_envs = self.compute_envs(tensors[0], state_input)
+
+        center = jnp.einsum('bjka, cjka->abc', left_envs[-1], right_envs[-1], optimize='optimal') # Nt, Xr, Xl
+        z = jnp.einsum('ail, ibl->ab', center, params_mps[self.half_sites][0], optimize='optimal')
+        z = jnp.real(z)
+
+        if self.use_nn:
+            activations, outputs = self.nn_forward(z, params[1], actions)
+            out = outputs[-1]
+        else:
+            out = self.scale * z
+            out = jnp.take_along_axis(out, jnp.expand_dims(actions, axis=(1)).reshape((-1,1)), axis=1).squeeze(axis=1)
+
+        f = (out - labels)
+
+        delta = jnp.zeros((Nt, n_labels), dtype=np.int32)
+        delta_new = jax.ops.index_update(delta, (np.arange(Nt), actions), 1)
+        g = jnp.matmul(f.reshape((Nt, 1, 1)), delta_new.reshape((Nt, 1, n_labels))).reshape((Nt, n_labels))
+
+        if self.use_nn:
+            grad_nn, g = self.nn_backward(g, params[1], activations, outputs)
+            g = (jnp.dot(g, params[1][0][0].transpose()))
+        else:
+            g = self.scale * g
+            grad_nn = []
+
+        grad = self.mpo_grad(g, center, params_mps, tensors[0], state_input, left_envs, right_envs)
+
+        return 0.5*jnp.mean(f**2), [grad, grad_nn]
+
+class QMPS(NN):
+    @classmethod
+    def eye(cls, sites, d=2, D=4, feature_dim=32, batch_size=64, share=True, uniform=False, std=0, norm_factor=1., nn=True, layer_sizes=[1], nn_scale=0.1, dtype="complex64", scale=1.0):
+        """ Trainable QMPS ansatz (MPS + NN) """
+        # label position is at center not at zero
+        half_sites = sites // 2
+        if share:
+            tensors_r = init_random_params(feature_dim, 2, D, center=half_sites, d=2, std=std, norm_factor=norm_factor, uniform=uniform, complex=False)
+            tensors_c = init_random_params(feature_dim, 2, D, center=half_sites, d=2, std=std, norm_factor=norm_factor, uniform=uniform, complex=True)
+        else:
+            tensors_r = init_random_params_batch(feature_dim, 2, D, center=half_sites, d=2, std=std, norm_factor=norm_factor, uniform=uniform, complex=False)
+            tensors_c = init_random_params_batch(feature_dim, 2, D, center=half_sites, d=2, std=std, norm_factor=norm_factor, uniform=uniform, complex=True)
+
+        tensors = [[p1, p2] for p1, p2 in zip(tensors_r, tensors_c)]
+
+        tensors = [tensors, initialize_nn(nn_scale, layer_sizes)]
+        n_labels = layer_sizes[-1]
+
+        return cls(params=tensors, sites=sites, nn=nn, d=d, D=D, feature_dim=feature_dim, batch_size=batch_size, n_labels=n_labels, share=share, scale=scale)
+
+    @partial(jit, static_argnums=(0,))
+    def get_tensors(self, params_mps):
+        return [t[0] + 1.j * t[1] for t in params_mps]
 
     @partial(jit, static_argnums=(0,))
     def norm(self, params):
-        """ Norm of QMPS """
-        # params_mps = params#[0]
         params_mps = params[0]
         left = jnp.einsum('bid,aic->abcd', params_mps[0][0] + 1.j * params_mps[0][1], params_mps[0][0] - 1.j * params_mps[0][1])
         for n, tensor in enumerate(params_mps[1:]):
             left = jnp.einsum('abji, ikd, jkc->abcd', left, tensor[0] + 1.j * tensor[1], tensor[0] - 1.j * tensor[1])
         return jnp.abs(left.reshape(-1))
 
-    @partial(jit, static_argnums=(0,))
-    def nn(self, params, inputs):
-        """ NN forward pass """
-        activations = inputs
-        for w, b in params[:-1]:
-            outputs = jnp.dot(activations, w) + b
-            # activations = outputs
-            activations = jnp.tanh(outputs)
+    def normalize(self, params_mps):
+        params = FiniteMPS(params_mps, center_position=0, canonicalize=True)
+        params.position(self.half_sites)
+        return params.tensors
 
-        final_w, final_b = params[-1]
-        result = jnp.dot(activations, final_w) + final_b
-        return result
+    # @partial(jit, static_argnums=(0,), inline=True)
+    def predict_share(self, params, state_input):
+        X = params[0]
 
-    @partial(jit, static_argnums=(0,))
-    def predict(self, params, state_input, goals=None):
-        """
-        QMPS forward pass on a batch of input:
-        Involves contraction of quantum state MPS and QMPS plus the subsequent NN pass
-        """
-        Nt, _, d, _ = state_input[0].shape
+        left = jnp.einsum('jid,zjic->zdc', X[0], state_input[0]) # D, X
+        for n, tensor in enumerate(X[1:self.half_sites]):
+            left = jnp.einsum('zij, ikd, zjkc->zdc', left, tensor, state_input[n+1], optimize='optimal')
+
+        right = jnp.einsum('dij,zcij->zdc', X[-1], state_input[-1]) # D, X
+        for n, tensor in enumerate(reversed(X[self.half_sites+1:-1])):
+            right = jnp.einsum('zij, dki, zckj->zdc', right, tensor, state_input[-(n+2)], optimize='optimal')
+
+        center = jnp.einsum('zai, zbi->zab', left, right) # Nt, Dr, Dl
+        z = jnp.einsum('zij, ibj->zb', center, X[self.half_sites], optimize='optimal')
+        out = self.scale*2.*jnp.log(jnp.abs(z) + self.eps) / self.sites + self.offset
+
+        if self.use_nn:
+            return self.nn(params[1], out)
+        else:
+            return out
+
+    # @partial(jit, static_argnums=(0,), inline=True)
+    def predict_batch(self, params, state_input):
+        X = params[0]
+
+        left = jnp.einsum('ajid,zjic->zadc', X[0], state_input[0]) # D, X
+        for n, tensor in enumerate(X[1:self.half_sites]):
+            left = jnp.einsum('zaij, aikd, zjkc->zadc', left, tensor, state_input[n+1], optimize='optimal')
+
+        right = jnp.einsum('adij,zcij->zadc', X[-1], state_input[-1]) # D, X
+        for n, tensor in enumerate(reversed(X[self.half_sites:-1])):
+            right = jnp.einsum('zaij, adki, zckj->zadc', right, tensor, state_input[-(n+2)], optimize='optimal')
+
+        center = jnp.einsum('zaji, zaji->za', left, right) # Nt, Dr, Dl
+        out = self.scale*2.*jnp.log(jnp.abs(center) + self.eps) / self.sites + self.offset
+
+        if self.use_nn:
+            return self.nn(params[1], out)
+        else:
+            return out
+
+    # @partial(jit, static_argnums=(0,), inline=True)
+    def predict2_share(self, params, state_input):
         params_mps = params[0]
-        # nfeat = params_mps[self.half_sites].shape[2]
 
-        right = jnp.dot(state_input[-1].squeeze(3), params_mps[-1][0] + 1.j * params_mps[-1][1]).squeeze(3) #(Nt, X, d) (D, d, 1)-> Nt, X, D
+        X = params_mps[0][0] + 1.j * params_mps[0][1]
+        left = jnp.einsum('rid,zsic->zdcrs', X, state_input[0]).squeeze(axis=(3,4)) # D, X
+        for n, tensor in enumerate(params_mps[1:self.half_sites]):
+            X = tensor[0] + 1.j * tensor[1]
+            left = jnp.einsum('zij, ikd, zjkc->zdc', left, X, state_input[n+1], optimize='optimal')
+
+        X = params_mps[-1][0] + 1.j * params_mps[-1][1]
+        right = jnp.einsum('dir,zcis->zdcrs', X, state_input[-1]).squeeze(axis=(3,4)) # D, X
         for n, tensor in enumerate(reversed(params_mps[self.half_sites+1:-1])):
-            # (Nt, X, D) (D, d, D) (Nt, X, d, X)
-            Dr = tensor[0].shape[0]
-            Xr = state_input[-(n+2)].shape[1]
-            right = jnp.dot(right, (tensor[0] + 1.j * tensor[1]).transpose(0,2,1)) #(Nt, X, D) (D, d, D) -> (Nt, X, D, d)
-            right = jnp.matmul(state_input[-(n+2)].reshape((Nt, d*Xr, -1)), right.reshape((Nt, -1, d*Dr))).reshape((Nt, Xr, d, Dr, d)) # (Nt, X, D, d) (Nt, X, d, X)
-            right = jnp.trace(right, axis1=2, axis2=4) # (Nt, X, D)
+            X = tensor[0] + 1.j * tensor[1]
+            right = jnp.einsum('zij, dki, zckj->zdc', right, X, state_input[-(n+2)], optimize='optimal')
 
-        left = jnp.dot(state_input[0].squeeze(1).transpose(0,2,1), params_mps[0][0] + 1.j * params_mps[0][1]).squeeze(2) #(Nt, X, d) (1, d, D)-> Nt, X, D
-        for n, tensor in enumerate(params_mps[1:self.half_sites]):
-            left = jnp.dot(left, (tensor[0] + 1.j * tensor[1]).transpose(1,0,2)) # (Nt, X, d, D)
-            _, Xl, _, Dr = left.shape
-            left = jnp.matmul(state_input[n+1].transpose(0,3,2,1).reshape((Nt, -1, Xl)), left.reshape((Nt, Xl, d*Dr))).reshape((Nt, -1, d, d, Dr)) # (Nt, X, D, d) (Nt, X, d, X)
-            left = jnp.trace(left, axis1=2, axis2=3) # (Nt, X, D)
-
-        center = jnp.matmul(left.transpose(0,2,1), right) # (Nt, D, D)
-        z = jnp.dot(center, (params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1]).transpose(0,2,1)) # (Nt, D, D, nl)
-        z = jnp.trace(z, axis1=1, axis2=2)
-
-
+        center = jnp.einsum('zai, zbi->zab', left, right) # Nt, Dr, Dl
+        X = params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1]
+        z = jnp.einsum('zij, ibj->zb', center, X, optimize='optimal')
+        out = self.scale*jnp.log(jnp.abs(z) ** 2 + self.eps) / self.sites + self.offset
         if self.use_nn:
-            out = self.scale*jnp.log(jnp.abs(z)**2 + self.eps) / self.sites + self.offset
-            if self.goal:
-                return self.nn(params[1], jnp.concatenate((out, goals.reshape((-1,1))), axis=1))
-            else:
-                return self.nn(params[1], out)
+            return self.nn(params[1], out)
         else:
-            # return self.sign * self.scale * jnp.abs(left.reshape(n_samples, -1)) + self.offset
-            return self.scale*jnp.log(jnp.abs(z)**2 + self.eps) / self.sites + self.offset
-            # return self.scale*2.*jnp.log(jnp.abs(z)) / self.sites + self.offset
-            # return self.sign * (scale**2) * jnp.abs(left.reshape(n_samples, -1)) + bias
+            return out
 
-
-    @partial(jit, static_argnums=(0,))
-    def predict_single(self, params, state_input, goal=None):
-        """
-        QMPS forward pass on a single input example:
-        Involves contraction of quantum state MPS and QMPS plus the subsequent NN pass
-        """
+    # @partial(jit, static_argnums=(0,), inline=True)
+    def predict2_batch(self, params, state_input):
         params_mps = params[0]
 
-        left = jnp.einsum('bid,aic->abcd', params_mps[0][0] + 1.j * params_mps[0][1], state_input[0])
+        X = params_mps[0][0] + 1.j * params_mps[0][1]
+        left = jnp.einsum('arid,zsic->zadcrs', X, state_input[0]).squeeze(axis=(4,5)) # D, X
         for n, tensor in enumerate(params_mps[1:self.half_sites]):
-            left = jnp.einsum('abji, ikd, jkc->abcd', left, tensor[0] + 1.j * tensor[1], state_input[n+1])
+            X = tensor[0] + 1.j * tensor[1]
+            left = jnp.einsum('zaij, aikd, zjkc->zadc', left, X, state_input[n+1], optimize='optimal')
 
-        left = jnp.einsum('bcdi, iae->abcde', left, params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1])
-        for n, tensor in enumerate(params_mps[self.half_sites+1:]):
-            left = jnp.einsum('abcji, ike, jkd->abcde', left, tensor[0] + 1.j * tensor[1], state_input[n+self.half_sites])
+        X = params_mps[-1][0] + 1.j * params_mps[-1][1]
+        right = jnp.einsum('adir,zcis->zadcrs', X, state_input[-1]).squeeze(axis=(4,5)) # D, X
+        for n, tensor in enumerate(reversed(params_mps[self.half_sites:-1])):
+            X = tensor[0] + 1.j * tensor[1]
+            right = jnp.einsum('zaij, adki, zckj->zadc', right, X, state_input[-(n+2)], optimize='optimal')
+
+        center = jnp.einsum('zaji, zaji->za', left, right) # Nt, Dr, Dl
+        out = self.scale*jnp.log(jnp.abs(center) ** 2 + self.eps) / self.sites + self.offset
+        if self.use_nn:
+            return self.nn(params[1], out)
+        else:
+            return out
+
+    # @partial(jit, static_argnums=(0,), inline=True)
+    def predict_fixed_batch(self, params, tensors, state_input):
+        X = tensors
+
+        left = jnp.einsum('ajid,zjic->zadc', X[0], state_input[0]) # D, X
+        for n, tensor in enumerate(X[1:self.half_sites]):
+            left = jnp.einsum('zaij, aikd, zjkc->zadc', left, tensor, state_input[n+1], optimize='optimal')
+
+        right = jnp.einsum('adij,zcij->zadc', X[-1], state_input[-1]) # D, X
+        for n, tensor in enumerate(reversed(X[self.half_sites:-1])):
+            right = jnp.einsum('zaij, adki, zckj->zadc', right, tensor, state_input[-(n+2)], optimize='optimal')
+
+        center = jnp.einsum('zaji, zaji->za', left, right) # Nt, Dr, Dl
+        out = self.scale*2.*jnp.log(jnp.abs(center) + self.eps) / self.sites + self.offset
+        if self.use_nn:
+            return self.nn(params, out)
+        else:
+            return out
+
+    @partial(jit, static_argnums=(0,), inline=True)
+    def predict_single_share(self, params, state_input):
+        """ Contracts the input and parameter MPS <psi|phi> """
+        X  = params[0]
+
+        left = jnp.einsum('jid,jic->dc', X[0], state_input[0]) # D, X
+        for n, tensor in enumerate(X[1:self.half_sites]):
+            left = jnp.einsum('ij, ikd, jkc->dc', left, tensor, state_input[n+1])
+
+        right = jnp.einsum('dij,cij->dc', X[-1], state_input[-1]) # D, X
+        for n, tensor in enumerate(reversed(X[self.half_sites+1:-1])):
+            right = jnp.einsum('ij, dki, ckj->dc', right, tensor, state_input[-(n+2)], optimize='optimal')
+
+        center = jnp.einsum('ai, bi->ab', left, right) # Nt, Dr, Dl
+        z = jnp.einsum('ij, ibj->b', center, X[self.half_sites], optimize='optimal')
+        out = self.scale*2.*jnp.log(jnp.abs(z) + self.eps) / self.sites + self.offset
 
         if self.use_nn:
-            out = self.scale*jnp.log(jnp.abs(left.reshape(-1))**2 + self.eps) / self.sites + self.offset
-            # out = self.scale*2.*jnp.log(jnp.abs(left.reshape(-1))) / self.sites + self.offset
-            if self.goal:
-                return self.nn(params[1], jnp.append(out, goal))
-            else:
-                return self.nn(params[1], out)
+            return self.nn(params[1], out)
         else:
-            # return self.sign * self.scale * jnp.abs(left.reshape(-1)) + self.offset
-            return self.scale*jnp.log(jnp.abs(left.reshape(-1))**2 + self.eps) / self.sites + self.offset
-            # return self.scale*2.*jnp.log(jnp.abs(left.reshape(-1))) / self.sites + self.offset
-            # return self.sign * (scale**2) * jnp.abs(left.reshape(-1)) + bias
+            return out
 
-    @partial(jit, static_argnums=(0,))
+    # @partial(jit, static_argnums=(0,), inline=True)
+    def predict_single_batch(self, params, state_input):
+        """ Contracts the input and parameter MPS <psi|phi> """
+        X  = params[0]
+
+        left = jnp.einsum('ajid,jic->adc', X[0], state_input[0]) # D, X
+        for n, tensor in enumerate(X[1:self.half_sites]):
+            left = jnp.einsum('aij, aikd, jkc->adc', left, tensor, state_input[n+1])
+
+        right = jnp.einsum('adij,cij->adc', X[-1], state_input[-1]) # D, X
+        for n, tensor in enumerate(reversed(X[self.half_sites:-1])):
+            right = jnp.einsum('aij, adki, ckj->adc', right, tensor, state_input[-(n+2)], optimize='optimal')
+
+        center = jnp.einsum('aji, aji->a', left, right) # Nt, Dr, Dl
+        out = self.scale*2.*jnp.log(jnp.abs(center) + self.eps) / self.sites + self.offset
+
+        if self.use_nn:
+            return self.nn(params[1], out)
+        else:
+            return out
+
+    # @profile
+    # @partial(jit, static_argnums=(0,))
+    def compute_envs(self, X, state_input):
+        left_envs, right_envs = [], []
+        left = jnp.einsum('jid,zjic->zdc', X[0], state_input[0]) # D, X
+        left_envs.append(left)
+        for n, tensor in enumerate(X[1:self.half_sites]):
+            left = jnp.einsum('zij, ikd, zjkc->zdc', left, tensor, state_input[n+1], optimize='optimal')
+            left_envs.append(left)
+
+        right = jnp.einsum('dij,zcij->zdc', X[-1], state_input[-1]) # D, X
+        right_envs.append(right)
+        for n, tensor in enumerate(reversed(X[self.half_sites+1:-1])):
+            right = jnp.einsum('zij, dki, zckj->zdc', right, tensor, state_input[-(n+2)], optimize='optimal')
+            right_envs.append(right)
+
+        return left_envs, right_envs
+
+    # @partial(jit, static_argnums=(0,), inline=True)
     def calc_grad(self, g):
         g = 2 * jnp.mean(g, axis=0)
         g_real = jnp.real(g)
         g_imag = -jnp.imag(g)
-        return jnp.array([g_real, g_imag])
+        return [g_real, g_imag]
 
-    @partial(jit, static_argnums=(0,))
-    def dtanh(self, x):
-        return 1 / jnp.cosh(x)**2
+    # @profile
+    # @partial(jit, static_argnums=(0,6,7,8), donate_argnums=4)
+    def mps_grad_step(self, A, state_input, env, env2, mode, mode2=None, mode3=None):
+        if mode == 'l':
+            if mode3 != 'end':
+                if mode2 == 'center':
+                    env = jnp.einsum('zij, zci, zabj->zabc', env, A, state_input, optimize='optimal') # Nt, X, d, D
+                else:
+                    env = jnp.einsum('zijk, cjk, zabi->zabc', env, A, state_input, optimize='optimal')
+                g = jnp.einsum('zai, zibc->zabc', env2, env, optimize='optimal')
+            else:
+                g = jnp.einsum('zijk, cjk, zabi->zabc', env, A, state_input, optimize='optimal')
 
-    # dot(a, b)[i,j,k,m] = sum(a[i,j,:] * b[k,:,m])
-    # (n,k),(k,m)->(n,m): (Nt, -1, :) * (Nt, :, -1)
+        elif mode == 'r':
+            if mode3 != 'end':
+                if mode2 == 'center':
+                    env = jnp.einsum('zij, zic, zjba->zabc', env, A, state_input, optimize='optimal') # Nt, X, d, D
+                else:
+                    env = jnp.einsum('zijk, kjc, ziba->zabc', env, A, state_input, optimize='optimal')
+                g = jnp.einsum('zci, ziba->zabc', env2, env, optimize='optimal')
+            else:
+                g = jnp.einsum('zijk, kjc, ziba->zcba', env, A, state_input, optimize='optimal')
+        return self.calc_grad(g), env
 
-    @partial(jit, static_argnums=(0,))
-    def value_and_grad_nn(self, params, state_input, labels, actions, goals=None):
-        """
-        QMPS forward & backward pass on a batch of training data:
-        Involves contraction of quantum state MPS and QMPS plus the subsequent NN pass
-
-        Returns:
-            (QMPS output, gradients)
-        """
-        Nt, _, d, _ = state_input[0].shape
-        params_mps = params[0]
-        nfeat = params_mps[self.half_sites].shape[2]
-
-        right_envs = []
-        right = jnp.dot(state_input[-1].squeeze(3), params_mps[-1][0] + 1.j * params_mps[-1][1]).squeeze(3) #(Nt, X, d) (D, d, 1)-> Nt, X, D
-        right_envs.append(right)
-        for n, tensor in enumerate(reversed(params_mps[self.half_sites+1:-1])):
-            # (Nt, X, D) (D, d, D) (Nt, X, d, X)
-            Dr = tensor[0].shape[0]
-            Xr = state_input[-(n+2)].shape[1]
-            right = jnp.dot(right, (tensor[0] + 1.j * tensor[1]).transpose(0,2,1)) #(Nt, X, D) (D, d, D) -> (Nt, X, D, d)
-            right = jnp.matmul(state_input[-(n+2)].reshape((Nt, d*Xr, -1)), right.reshape((Nt, -1, d*Dr))).reshape((Nt, Xr, d, Dr, d)) # (Nt, X, D, d) (Nt, X, d, X)
-            right = jnp.trace(right, axis1=2, axis2=4) # (Nt, X, D)
-            right_envs.append(right)
-
-        left_envs = []
-        left = jnp.dot(state_input[0].squeeze(1).transpose(0,2,1), params_mps[0][0] + 1.j * params_mps[0][1]).squeeze(2) #(Nt, X, d) (1, d, D)-> Nt, X, D
-        left_envs.append(left) # (Nt, X, D)
-        for n, tensor in enumerate(params_mps[1:self.half_sites]):
-            left = jnp.dot(left, (tensor[0] + 1.j * tensor[1]).transpose(1,0,2)) # (Nt, X, d, D)
-            _, Xl, d, Dr = left.shape
-            left = jnp.matmul(state_input[n+1].transpose(0,3,2,1).reshape((Nt, -1, Xl)), left.reshape((Nt, Xl, d*Dr))).reshape((Nt, -1, d, d, Dr)) # (Nt, X, D, d) (Nt, X, d, X)
-            left = jnp.trace(left, axis1=2, axis2=3) # (Nt, X, D)
-            left_envs.append(left)
-
-        center = jnp.matmul(left.transpose(0,2,1), right) # (Nt, D, D)
-        z = jnp.dot(center, (params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1]).transpose(0,2,1)) # (Nt, D, D, nl)
-        z = jnp.trace(z, axis1=1, axis2=2)
-
-        y = jnp.real(z * jnp.conjugate(z))
-        value = self.scale * jnp.log(y+self.eps) / self.sites + self.offset # change if different activation
-
-
-        ## NN
-        grad_nn = []
-        activations, outputs = [], []
-        activations.append(value)
-        for w, b in params[1][:-1]:
-            outputs.append(jnp.dot(activations[-1], w) + b)
-            activations.append(jnp.tanh(outputs[-1]))
-
-        final_w, final_b = params[1][-1]
-        out = jnp.dot(activations[-1], final_w) + final_b
-        n_labels = out.shape[1]
-        out = jnp.take_along_axis(out, jnp.expand_dims(actions, axis=(1)).reshape((-1,1)), axis=1).squeeze(axis=1)
-        outputs.append(out)
-
-        f = (out - labels)
-
-        # gradients
-        # last layer
-        delta = jnp.zeros((Nt, n_labels), dtype=np.int32)
-        delta_new = jax.ops.index_update(delta, (np.arange(Nt), actions), 1)
-
-        g = jnp.matmul(f.reshape((Nt, 1, 1)), delta_new.reshape((Nt, 1, n_labels))).reshape((Nt, n_labels))
-        grad_b = jnp.mean(g, axis=0)
-        gg = jnp.matmul(activations[-1].reshape((Nt, -1, 1)), g.reshape((Nt, 1, -1)))
-        grad_w = jnp.mean(gg , axis=0)
-        grad_nn.append((grad_w, grad_b))
-
-        # middle layer
-        for i, output in enumerate(reversed(outputs[:-1])):
-            g = jnp.dot(g, params[1][-(i+1)][0].transpose()) * self.dtanh(output)
-            grad_b = jnp.mean(g, axis=0)
-            gg = jnp.matmul(activations[-(i+2)].reshape((Nt, -1, 1)), g.reshape((Nt, 1, -1)))
-            grad_w = jnp.mean(gg, axis=0)
-            grad_nn = [(grad_w, grad_b)] + grad_nn
-
-        dvalue = self.scale / (self.sites * (y+self.eps)) # change if different activation
-        g = (jnp.dot(g, params[1][0][0].transpose()))
-        dloss = ((g * dvalue) * jnp.conjugate(z)).reshape((Nt,1,1,nfeat,1))
+    # @profile
+    # @partial(jit, static_argnums=(0,))
+    def mps_grad(self, dloss, center, params_mps, state_input, left_envs, right_envs):
         grad = []
 
-        D, _, _ = params_mps[self.half_sites][0].shape
-        g = jnp.matmul(center.reshape((Nt, D*D, 1)), dloss.reshape((Nt, 1, -1))).reshape((Nt, D, D, nfeat)).transpose(0,1,3,2)
+        g = jnp.matmul(center.reshape((self.Nt, self.D*self.D, 1)), dloss).reshape((self.Nt, self.D, self.D, -1)).transpose(0,1,3,2)
         grad.append(self.calc_grad(g))
 
-        ddloss = jnp.dot(dloss.reshape((Nt, 1, nfeat)), params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1]).squeeze(1) # (Nt, D, D)
+        ddloss = jnp.dot(dloss, params_mps[self.half_sites]).squeeze(1) # (Nt, D, D)
 
         # optimize half_sites-1
-        _, Xl, _, Xr = state_input[self.half_sites-1].shape
-        rightt = jnp.matmul(right, ddloss.transpose(0,2,1)) # (Nt, X, D)
-        rightt = jnp.matmul(state_input[self.half_sites-1].reshape((Nt, Xl*d, Xr)), rightt).reshape((Nt, Xl, d, -1)) # (Nt, X, d, D)
-        g = jnp.matmul(left_envs[-2].transpose(0,2,1), rightt.reshape((Nt, Xl, -1))).reshape((Nt, -1, d, D))
-        grad.append(self.calc_grad(g))
+        gg, rightt = self.mps_grad_step(ddloss, state_input[self.half_sites-1], right_envs[-1], left_envs[-2], 'l', mode2='center')
+        grad.append(gg)
 
         # optimize beginning - half_sites-1
         for n, tensor in enumerate(reversed(params_mps[2:self.half_sites])):
-            _, Xl, _, Xr = state_input[self.half_sites-n-2].shape
-            rightt = jnp.dot(rightt.reshape((Nt, Xr*d, -1)), (tensor[0] + 1.j * tensor[1]).transpose(0,2,1)).reshape((Nt, Xr, d, -1, d))
-            rightt = jnp.trace(rightt, axis1=2, axis2=4) # (Nt, Xl, D)
-            rightt = jnp.matmul(state_input[self.half_sites-n-2].reshape((Nt, Xl*d, Xr)), rightt).reshape((Nt, Xl, d, -1)) # Nt, X, d, D
-            Dr = rightt.shape[3]
-            g = jnp.matmul(left_envs[-(n+3)].transpose(0,2,1), rightt.reshape((Nt, Xl, d*Dr))).reshape((Nt, -1, d, Dr))
-            grad.append(self.calc_grad(g))
+            gg, rightt = self.mps_grad_step(tensor, state_input[self.half_sites-n-2], rightt, left_envs[-(n+3)], 'l')
+            grad.append(gg)
 
         # optimize beginning
-        Xr = state_input[0].shape[3]
-        rightt = jnp.dot(rightt.reshape((Nt, Xr*d, -1)), (params_mps[1][0] + 1.j * params_mps[1][1]).transpose(0,2,1)).reshape((Nt, Xr, d, -1, d))
-        rightt = jnp.trace(rightt, axis1=2, axis2=4) # (Nt, Xl, D)
-        g = jnp.matmul(state_input[0].reshape((Nt, d, Xr)), rightt).reshape((Nt, 1, d, -1)) # Nt, X, d, D
-        grad.append(self.calc_grad(g))
+        gg, rightt = self.mps_grad_step(params_mps[1], state_input[0], rightt, left_envs[0], 'l', mode3='end')
+        grad.append(gg)
 
         grad = grad[::-1]
 
         # optimize half_sites+1
-        _, Xl, _, Xr = state_input[self.half_sites].shape
-        leftt = jnp.matmul(left, ddloss) # (Nt, X, D)
-        leftt = jnp.matmul(leftt.transpose(0,2,1), state_input[self.half_sites].reshape((Nt, Xl, d*Xr))).reshape((Nt, -1, d, Xr)) # (Nt, D, d, X)
-        g = jnp.matmul(leftt.reshape((Nt, -1, Xr)), right_envs[-2]).reshape((Nt, D, d, -1))#.transpose(0,1,3,2,4)
-        grad.append(self.calc_grad(g))
+        gg, leftt = self.mps_grad_step(ddloss, state_input[self.half_sites], left_envs[-1], right_envs[-2], 'r', mode2='center')
+        grad.append(gg)
 
         # optimize half_sites+2 - end
         for n, tensor in enumerate(params_mps[self.half_sites+1:-2]):
-            _, Xl, _, Xr = state_input[self.half_sites+1+n].shape
-            leftt = jnp.dot(leftt.transpose(0,2,3,1).reshape((Nt, d*Xl, -1)), (tensor[0] + 1.j * tensor[1]).transpose(1,0,2)).reshape((Nt, d, Xl, d, -1))
-            leftt = jnp.trace(leftt, axis1=1, axis2=3) # (Nt, Xl, D)
-            leftt = jnp.matmul(leftt.transpose(0,2,1), state_input[self.half_sites+1+n].reshape((Nt, Xl, d*Xr))).reshape((Nt, -1, d, Xr)) # Nt, D, d, X
-            Dr = leftt.shape[1]
-            g = jnp.matmul(leftt.reshape((Nt, -1, Xr)), right_envs[-(n+3)]).reshape((Nt, Dr, d, -1))#.transpose(0,1,3,2,4)
-            grad.append(self.calc_grad(g))
+            gg, leftt = self.mps_grad_step(tensor, state_input[self.half_sites+1+n], leftt, right_envs[-(n+3)], 'r')
+            grad.append(gg)
 
         # optimize end
-        Xl = state_input[-1].shape[1]
-        leftt = jnp.dot(leftt.transpose(0,2,3,1).reshape((Nt, d*Xl, -1)), (params_mps[-2][0] + 1.j * params_mps[-2][1]).transpose(1,0,2)).reshape((Nt, d, Xl, d, -1))
-        leftt = jnp.trace(leftt, axis1=1, axis2=3) # (Nt, Xl, D)
-        g = jnp.matmul(leftt.transpose(0,2,1), state_input[-1].reshape((Nt, Xl, d))).reshape((Nt, -1, d, 1)) # Nt, D, d, X
-        grad.append(self.calc_grad(g))
+        gg, leftt = self.mps_grad_step(params_mps[-2], state_input[-1], leftt, left_envs[-1], 'r', mode3='end')
+        grad.append(gg)
 
-        return 0.5*jnp.mean(f**2), [grad, grad_nn]
+        return grad
 
+    # @profile
     @partial(jit, static_argnums=(0,))
-    def value_and_grad_nn_goals(self, params, state_input, labels, actions, goals=None):
-        Nt, _, d, _ = state_input[0].shape
-        params_mps = params[0]
-        nfeat = params_mps[self.half_sites].shape[2]
+    def value_and_grad(self, params, tensors, state_input, labels, actions):
+        """ Computes loss function and gradient """
+        params_mps = tensors[0]
 
-        right_envs = []
-        right = jnp.dot(state_input[-1].squeeze(3), params_mps[-1][0] + 1.j * params_mps[-1][1]).squeeze(3) #(Nt, X, d) (D, d, 1)-> Nt, X, D
-        right_envs.append(right)
-        for n, tensor in enumerate(reversed(params_mps[self.half_sites+1:-1])):
-            # (Nt, X, D) (D, d, D) (Nt, X, d, X)
-            Dr = tensor[0].shape[0]
-            Xr = state_input[-(n+2)].shape[1]
-            right = jnp.dot(right, (tensor[0] + 1.j * tensor[1]).transpose(0,2,1)) #(Nt, X, D) (D, d, D) -> (Nt, X, D, d)
-            right = jnp.matmul(state_input[-(n+2)].reshape((Nt, d*Xr, -1)), right.reshape((Nt, -1, d*Dr))).reshape((Nt, Xr, d, Dr, d)) # (Nt, X, D, d) (Nt, X, d, X)
-            right = jnp.trace(right, axis1=2, axis2=4) # (Nt, X, D)
-            right_envs.append(right)
+        left_envs, right_envs = self.compute_envs(params_mps, state_input) # Nt, D, X
 
-        left_envs = []
-        left = jnp.dot(state_input[0].squeeze(1).transpose(0,2,1), params_mps[0][0] + 1.j * params_mps[0][1]).squeeze(2) #(Nt, X, d) (1, d, D)-> Nt, X, D
-        left_envs.append(left) # (Nt, X, D)
-        for n, tensor in enumerate(params_mps[1:self.half_sites]):
-            left = jnp.dot(left, (tensor[0] + 1.j * tensor[1]).transpose(1,0,2)) # (Nt, X, d, D)
-            _, Xl, d, Dr = left.shape
-            left = jnp.matmul(state_input[n+1].transpose(0,3,2,1).reshape((Nt, -1, Xl)), left.reshape((Nt, Xl, d*Dr))).reshape((Nt, -1, d, d, Dr)) # (Nt, X, D, d) (Nt, X, d, X)
-            left = jnp.trace(left, axis1=2, axis2=3) # (Nt, X, D)
-            left_envs.append(left)
-
-        center = jnp.matmul(left.transpose(0,2,1), right) # (Nt, D, D)
-        z = jnp.dot(center, (params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1]).transpose(0,2,1)) # (Nt, D, D, nl)
-        z = jnp.trace(z, axis1=1, axis2=2)
-
+        center = jnp.einsum('zai, zbi->zab', left_envs[-1], right_envs[-1], optimize='optimal') # Nt, Dr, Dl
+        z = jnp.einsum('zij, ibj->zb', center, params_mps[self.half_sites], optimize='optimal')
         y = jnp.real(z * jnp.conjugate(z))
         value = self.scale * jnp.log(y+self.eps) / self.sites + self.offset # change if different activation
 
-        value2 = jnp.concatenate((value, goals.reshape((-1,1))), axis=1)
-
-        ## NN
-        grad_nn = []
-        activations, outputs = [], []
-        activations.append(value2)
-        for w, b in params[1][:-1]:
-            outputs.append(jnp.dot(activations[-1], w) + b)
-            activations.append(jnp.tanh(outputs[-1]))
-
-        final_w, final_b = params[1][-1]
-        out = jnp.dot(activations[-1], final_w) + final_b
-        n_labels = out.shape[1]
-        out = jnp.take_along_axis(out, jnp.expand_dims(actions, axis=(1)).reshape((-1,1)), axis=1).squeeze(axis=1)
-        outputs.append(out)
+        if self.use_nn:
+            activations, outputs = self.nn_forward(value, params[1], actions)
+            out = outputs[-1]
+        else:
+            out = value
+            out = jnp.take_along_axis(out, jnp.expand_dims(actions, axis=(1)).reshape((-1,1)), axis=1).squeeze(axis=1)
 
         f = (out - labels)
 
-        # gradients
-        # last layer
-        delta = jnp.zeros((Nt, n_labels), dtype=np.int32)
-        delta_new = jax.ops.index_update(delta, (np.arange(Nt), actions), 1)
+        delta = jnp.zeros((self.Nt, self.n_labels), dtype=np.int32)
+        delta_new = delta.at[np.arange(self.Nt), actions].set(1)
 
-        g = jnp.matmul(f.reshape((Nt, 1, 1)), delta_new.reshape((Nt, 1, n_labels))).reshape((Nt, n_labels))
-        grad_b = jnp.mean(g, axis=0)
-        gg = jnp.matmul(activations[-1].reshape((Nt, -1, 1)), g.reshape((Nt, 1, -1)))
-        grad_w = jnp.mean(gg , axis=0)
-        grad_nn.append((grad_w, grad_b))
+        g = jnp.matmul(f.reshape((self.Nt, 1, 1)), delta_new.reshape((self.Nt, 1, self.n_labels))).reshape((self.Nt, self.n_labels))
 
-        # middle layer
-        for i, output in enumerate(reversed(outputs[:-1])):
-            g = jnp.dot(g, params[1][-(i+1)][0].transpose()) * self.dtanh(output)
-            grad_b = jnp.mean(g, axis=0)
-            gg = jnp.matmul(activations[-(i+2)].reshape((Nt, -1, 1)), g.reshape((Nt, 1, -1)))
-            grad_w = jnp.mean(gg, axis=0)
-            grad_nn = [(grad_w, grad_b)] + grad_nn
-
+        if self.use_nn:
+            grad_nn, g = self.nn_backward(g, params[1], activations, outputs)
+            g = (jnp.dot(g, params[1][0][0].transpose()))
+        else:
+            grad_nn = []
 
         dvalue = self.scale / (self.sites * (y+self.eps)) # change if different activation
-        g = (jnp.dot(g, params[1][0][0][:-1,:].transpose()))
-        dloss = ((g * dvalue) * jnp.conjugate(z)).reshape((Nt,1,1,nfeat,1))
-        grad = []
+        dloss = ((g * dvalue) * jnp.conjugate(z)).reshape((self.Nt, 1, -1))
 
-        D, _, _ = params_mps[self.half_sites][0].shape
-        g = jnp.matmul(center.reshape((Nt, D*D, 1)), dloss.reshape((Nt, 1, -1))).reshape((Nt, D, D, nfeat)).transpose(0,1,3,2)
-        grad.append(self.calc_grad(g))
-
-        ddloss = jnp.dot(dloss.reshape((Nt, 1, nfeat)), params_mps[self.half_sites][0] + 1.j * params_mps[self.half_sites][1]).squeeze(1) # (Nt, D, D)
-
-        # optimize half_sites-1
-        _, Xl, _, Xr = state_input[self.half_sites-1].shape
-        rightt = jnp.matmul(right, ddloss.transpose(0,2,1)) # (Nt, X, D)
-        rightt = jnp.matmul(state_input[self.half_sites-1].reshape((Nt, Xl*d, Xr)), rightt).reshape((Nt, Xl, d, -1)) # (Nt, X, d, D)
-        g = jnp.matmul(left_envs[-2].transpose(0,2,1), rightt.reshape((Nt, Xl, -1))).reshape((Nt, -1, d, D))
-        grad.append(self.calc_grad(g))
-
-        # optimize beginning - half_sites-1
-        for n, tensor in enumerate(reversed(params_mps[2:self.half_sites])):
-            _, Xl, _, Xr = state_input[self.half_sites-n-2].shape
-            rightt = jnp.dot(rightt.reshape((Nt, Xr*d, -1)), (tensor[0] + 1.j * tensor[1]).transpose(0,2,1)).reshape((Nt, Xr, d, -1, d))
-            rightt = jnp.trace(rightt, axis1=2, axis2=4) # (Nt, Xl, D)
-            rightt = jnp.matmul(state_input[self.half_sites-n-2].reshape((Nt, Xl*d, Xr)), rightt).reshape((Nt, Xl, d, -1)) # Nt, X, d, D
-            Dr = rightt.shape[3]
-            g = jnp.matmul(left_envs[-(n+3)].transpose(0,2,1), rightt.reshape((Nt, Xl, d*Dr))).reshape((Nt, -1, d, Dr))
-            grad.append(self.calc_grad(g))
-
-        # optimize beginning
-        Xr = state_input[0].shape[3]
-        rightt = jnp.dot(rightt.reshape((Nt, Xr*d, -1)), (params_mps[1][0] + 1.j * params_mps[1][1]).transpose(0,2,1)).reshape((Nt, Xr, d, -1, d))
-        rightt = jnp.trace(rightt, axis1=2, axis2=4) # (Nt, Xl, D)
-        g = jnp.matmul(state_input[0].reshape((Nt, d, Xr)), rightt).reshape((Nt, 1, d, -1)) # Nt, X, d, D
-        grad.append(self.calc_grad(g))
-
-        grad = grad[::-1]
-
-        # optimize half_sites+1
-        _, Xl, _, Xr = state_input[self.half_sites].shape
-        leftt = jnp.matmul(left, ddloss) # (Nt, X, D)
-        leftt = jnp.matmul(leftt.transpose(0,2,1), state_input[self.half_sites].reshape((Nt, Xl, d*Xr))).reshape((Nt, -1, d, Xr)) # (Nt, D, d, X)
-        g = jnp.matmul(leftt.reshape((Nt, -1, Xr)), right_envs[-2]).reshape((Nt, D, d, -1))#.transpose(0,1,3,2,4)
-        grad.append(self.calc_grad(g))
-
-        # optimize half_sites+2 - end
-        for n, tensor in enumerate(params_mps[self.half_sites+1:-2]):
-            _, Xl, _, Xr = state_input[self.half_sites+1+n].shape
-            leftt = jnp.dot(leftt.transpose(0,2,3,1).reshape((Nt, d*Xl, -1)), (tensor[0] + 1.j * tensor[1]).transpose(1,0,2)).reshape((Nt, d, Xl, d, -1))
-            leftt = jnp.trace(leftt, axis1=1, axis2=3) # (Nt, Xl, D)
-            leftt = jnp.matmul(leftt.transpose(0,2,1), state_input[self.half_sites+1+n].reshape((Nt, Xl, d*Xr))).reshape((Nt, -1, d, Xr)) # Nt, D, d, X
-            Dr = leftt.shape[1]
-            g = jnp.matmul(leftt.reshape((Nt, -1, Xr)), right_envs[-(n+3)]).reshape((Nt, Dr, d, -1))#.transpose(0,1,3,2,4)
-            grad.append(self.calc_grad(g))
-
-        # optimize end
-        Xl = state_input[-1].shape[1]
-        leftt = jnp.dot(leftt.transpose(0,2,3,1).reshape((Nt, d*Xl, -1)), (params_mps[-2][0] + 1.j * params_mps[-2][1]).transpose(1,0,2)).reshape((Nt, d, Xl, d, -1))
-        leftt = jnp.trace(leftt, axis1=1, axis2=3) # (Nt, Xl, D)
-        g = jnp.matmul(leftt.transpose(0,2,1), state_input[-1].reshape((Nt, Xl, d))).reshape((Nt, -1, d, 1)) # Nt, D, d, X
-        grad.append(self.calc_grad(g))
+        grad = self.mps_grad(dloss, center, params_mps, state_input, left_envs, right_envs)
 
         return 0.5*jnp.mean(f**2), [grad, grad_nn]

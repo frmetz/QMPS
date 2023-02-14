@@ -1,10 +1,8 @@
 import time
-import sys
 import itertools
-import random
-import math
 from functools import partial
-import pickle as pkl
+import random
+import copy
 import numpy as np
 
 import jax
@@ -12,11 +10,14 @@ import jax
 # jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from jax import jit, grad, tree_map, value_and_grad
-from jax.experimental import optimizers
+from jax.example_libraries import optimizers
 
-from replay_buffers import BasicBuffer
+from replay_buffers import *
 from models import *
 
+
+def block_until_ready(pytree):
+  return tree_map(lambda x: x.block_until_ready(), pytree)
 
 class DQNAgent:
     """
@@ -41,197 +42,160 @@ class DQNAgent:
                         whether QMPS bond dimension is fixed uniformly or not (exponentially growing towards the center)
         nn:             bool
                         whether to append neural network to QMPS output
+        tn:             str
+                        determines tn ansatz: either 'mps' or 'mpo'
         n_feat:         int
                         feature vector dimension (QMPS output dimension if NN is used as well)
-        factor:         float
-                        factor by which initial QMPS tensor parameters are scaled
-        offset:         float
-                        constant to add as offset to QMPS output
-        scale:          float
-                        constant by which QMPS output is scaled
-        sign:           float
-                        which sign should QMPS output have (after log is applied), only important when training without NN
-        chiq:           int
+        std:            float
+                        Gaussian standard deviation when initializing tensors
+        D:              int
                         QMPS bond dimension if NN is used as well
-        polyak:         bool
-                        polyakov averaging for weights in target network
-        tau:            float
-                        polyakov averaging parameter
-        goal:           bool
-                        true for multi-task RL
         initial_params  list(ndarray)
                         initial paramters for QMPS network (otherwise it is initialized randomly)
-        dtype:          string
-                        sets precision/type of numpy arrays
-        profiling:      bool
-                        when profiling code (needed due to jax's asynchronous dispatch)
         seed:           int
                         random seed
     """
     def __init__(self,
                 env,
                 double: bool=True,
-                learning_rate: float=3e-4,
+                learning_rate: float=1e-4,
                 gamma: float=1.0,
-                buffer_size: int=10000,
-                batch_size: int=128,
-                hidden_dim: int=32,
+                buffer_size: int=8000,
+                batch_size: int=64,
+                hidden_dim: int=100,
                 uniform: bool=True,
                 nn: bool=True,
+                tn='mps',
                 n_feat: int=32,
-                factor: float=4.0,
+                std: float=0.5,
+                D=16,
+                initial_params=None,
+                seed: int=123,
+                factor: float=1.0,
                 offset: float=0,
                 scale: float=1.0,
                 sign: float=1.0,
-                chiq: int=16,
-                polyak: bool=False,
-                tau: float=0.01,
-                goal: bool=False,
-                initial_params=None,
+                share=True,
+                fixed=False,
                 dtype: str="float",
-                profiling: bool=False,
-                seed: int=123
+                profiling: bool=False
                 ):
 
         self.env = env
         self.double = double
-        self.polyak = polyak
-        self.tau = tau
         self.gamma = gamma
-        self.dtype = dtype
+        self.D = D
         self.profiling = profiling
         self.nn = nn
         print("Use NN: ", nn)
+        print("Default platform: ", jax.devices()[0].platform)
 
-        self.itercount = itertools.count()
+        Buffer = BasicBuffer_cpu if jax.devices()[0].platform == "cpu" else BasicBuffer_gpu
+        self.replay_buffer = Buffer(env, max_size=buffer_size, batch_size=batch_size)
+
         np.random.seed(seed)
+        self.rng = jax.random.PRNGKey(seed)
 
-        self.n_states = env.L
-        self.n_actions = env.n_actions
-
-        # if self.env.time_qudit:
-        #     MPS = QMPS_Time
-        # else:
-        #     MPS = QMPS
-
-        self.replay_buffer = BasicBuffer(env, max_size=buffer_size, batch_size=batch_size, goal=goal)
-
-        # NN layers
-        if goal:
-            layer_sizes = [n_feat+1, hidden_dim, hidden_dim, self.n_actions]
-        else:
-            layer_sizes = [n_feat, hidden_dim, hidden_dim, self.n_actions]
-        mps_output_size = n_feat if nn else self.n_actions
-
-        self.model = QMPS(self.env.L, scale=scale, sign=sign, offset=offset, nn=self.nn, goal=goal)
-        self.value_and_grad = self.model.value_and_grad_nn_goals if goal else self.model.value_and_grad_nn
-        self.predict_single = self.model.predict_single
-        self.predict = self.model.predict
-
-        d = 2
-        std = 0.2
-        norm_factor = factor
-        if nn:
-            hidden_dim = 2**(env.L//2)
-            if hidden_dim > chiq:
-                hidden_dim = chiq
-
-        init_params_list = [self.model.init_random_params(mps_output_size, d, hidden_dim, env.n_time_steps, std=std, norm_factor=norm_factor, uniform=uniform) for _ in range(2)]
-        init_params = [jnp.array([p1, p2]) for p1,p2 in zip(init_params_list[0], init_params_list[1])]#, scale*np.ones(env.n_actions), offset*np.ones(env.n_actions)]
-        print("QMPS tensor dimensions: ", [p.shape for p in init_params])
-
-        # print([np.min(np.abs(p)) for p in init_params])
-        # print([np.max(np.abs(p)) for p in init_params])
-
-        nn_scale = 0.1
-        init_params = [init_params, initialize_nn(nn_scale, layer_sizes)] if nn else [init_params]
+        layer_sizes = [n_feat, hidden_dim, hidden_dim, self.env.n_actions]
         print("NN layer dimensions: ", layer_sizes)
 
-        if initial_params != None:
-            print("Use pre-trained parameters!")
-            with open(initial_params+".pkl", 'rb') as handle:
-                init_params = pkl.load(handle)
+        d = 2 if tn == 'mps' else 4
+        D = d**(env.L//2) if env.L < 20 else d**10
+        D = self.D if D > self.D else D
 
-        self.target_params = init_params.copy()
+        n_feat = n_feat if nn else self.env.n_actions
+        self.share = share
 
+        TN = QMPS if tn == 'mps' else QMPO
+        self.model = TN.eye(env.L, 2, D, n_feat, batch_size, share=share, uniform=uniform, std=std, norm_factor=factor, nn=nn, layer_sizes=layer_sizes, nn_scale=0.1)
+
+        # fixed = False
+        self.fixed = fixed
+        # self.opt_init, self.opt_update, self.get_params = optimizers.sgd(learning_rate)
         self.opt_init, self.opt_update, self.get_params = optimizers.adam(learning_rate)
-        self.opt_state = self.opt_init(init_params)
-        self.params = init_params
+        self.opt_state = self.opt_init(self.model.params) if not fixed else self.opt_init(self.model.params[1])
+        self.params = self.get_params(self.opt_state)
+        self.itercount = itertools.count()
+
+        self.tensors = [self.model.get_tensors(self.model.params[0])] + [self.model.params[1]]
+        self.target_tensors = self.tensors.copy()
+
+        print("QMPS tensor dimensions: ", [t.shape for t in self.tensors[0]])
 
 
-    def norm(self):
-        """ Norm of QMPS """
-        params = self.get_params(self.opt_state)
-        return self.model.norm(params)[0]
+    @partial(jit, static_argnums=(0,), donate_argnums=1)
+    def random_action(self, key):
+        key, subkey= jax.random.split(key)
+        action = jax.random.choice(subkey, self.env.n_actions)
+        return action, key
+
+    @partial(jit, static_argnums=(0,))
+    def greedy_action(self, tensors, state):
+        qvals = self.model.predict_single(tensors, state)
+        return jnp.argmax(qvals)
 
     # @profile
-    def get_action(self, state, goal, eps=0.0):
+    def get_action(self, state, eps=0.0):
         """ epsilon greedy action selection (acts greedily by default) """
         if(np.random.rand() < eps):
-            return np.random.randint(self.n_actions)
+            action, self.rng = self.random_action(self.rng)
         else:
-            params = self.get_params(self.opt_state)
-            qvals = self.predict_single(params, state, goal=goal)
-            if self.profiling: qvals.block_until_ready()
-            action = jnp.argmax(qvals)
-            # print(action)
-            if self.profiling: action.block_until_ready()
+            action = self.greedy_action(self.tensors, state)
         return action
 
     @partial(jit, static_argnums=(0,))
-    def loss(self, params, states, labels, actions, goals=None):
+    def loss(self, params, states, labels, actions):
         """ DQN regression loss """
-        preds = self.predict(params, states, goals=goals)
+        preds = self.model.predict2(params, states)
         preds_select = jnp.take_along_axis(preds, jnp.expand_dims(actions, axis=1), axis=1)
         return jnp.mean(0.5 * (preds_select.squeeze() - labels)**2)
 
     @partial(jit, static_argnums=(0,))
-    def calculate_target(self, params, next_states, rewards, dones, target_params, goals=None):
+    def loss_fixed_batch(self, params, tensors, states, labels, actions):
+        """ DQN regression loss """
+        preds = self.model.predict_fixed_batch(params, tensors, states)
+        preds_select = jnp.take_along_axis(preds, jnp.expand_dims(actions, axis=1), axis=1)
+        return jnp.mean(0.5 * (preds_select.squeeze() - labels)**2)
+
+    @partial(jit, static_argnums=(0,))
+    def calculate_target(self, params, next_states, rewards, dones, target_params):
         """ DQN regression target """
         if self.double: # Hasselt 2015
-            max_actions = jnp.argmax(self.predict(params, next_states, goals=goals), 1) # take argmax action according to model
-            # print(max_actions)
-            max_next_Q = jnp.take_along_axis(self.predict(target_params, next_states, goals=goals), jnp.expand_dims(max_actions, axis=1), axis=1)# use target for evaluation
+            max_actions = jnp.argmax(self.model.predict(params, next_states), 1) # take argmax action according to model
+            max_next_Q = jnp.take_along_axis(self.model.predict(target_params, next_states), jnp.expand_dims(max_actions, axis=1), axis=1)# use target for evaluation
             max_next_Q = max_next_Q.squeeze(1)
         else:
-            next_Q = self.predict(target_params, next_states, goals=goals)
+            next_Q = self.model.predict(target_params, next_states)
             max_next_Q = jnp.max(next_Q, 1)
 
         labels = jax.lax.stop_gradient(rewards + (1 - dones) * self.gamma * max_next_Q)
         return labels
 
-
     # @profile
     def update(self, batch_size):
-        """ updates model (and target if polyak averaging) on single mini batch """
-        transitions = self.replay_buffer.sample(batch_size)
-        states, next_states, time_batch, next_time_batch, rewards, actions, dones, goals = transitions
+        """ Updates model on single mini batch """
+        transitions = self.replay_buffer.sample()
+        states, next_states, rewards, actions, dones = transitions
 
-        if self.env.time_qudit:
-            states = (states, time_batch)
-            next_states = (next_states, next_time_batch)
-
-        params = self.get_params(self.opt_state)
-        labels = self.calculate_target(params, next_states, rewards, dones, self.target_params, goals=goals)
+        labels = self.calculate_target(self.tensors, next_states, rewards, dones, self.target_tensors)
         if self.profiling: labels.block_until_ready()
 
+        if self.fixed:
+            if self.share:
+                raise NotImplementedError()
+            else:
+                loss, gradients = value_and_grad(self.loss_fixed_batch)(self.params, self.tensors[0], states, labels, actions)
+        else:
+            loss, gradients = self.model.value_and_grad(self.params, self.tensors, states, labels, actions)
 
-        # start_time = time.time()
-        loss, gradients = self.model.value_and_grad_nn(params, states, labels, actions, goals=goals)
-        if self.profiling: [g.block_until_ready() for g in gradients[0]]
-        # print("CUS3: ", time.time() - start_time)
 
-
-        # start_time = time.time()
         self.opt_state = jit(self.opt_update)(next(self.itercount), gradients, self.opt_state)
-        if self.profiling: jax.tree_util.tree_flatten(self.opt_state)[0][0].block_until_ready()
-        # print(time.time() - start_time)
+        if self.profiling: block_until_ready(self.opt_state)
 
-
-        # target network update
-        if self.double and self.polyak:
-            params = self.get_params(self.opt_state)
-            for i, (target_param, param) in enumerate(zip(self.target_params, params)):
-                self.target_params[i] = (self.tau * param + (1 - self.tau) * target_param).copy()
+        self.params = jit(self.get_params)(self.opt_state)
+        if self.fixed:
+            self.tensors[1] = self.params
+        else:
+            self.tensors = [self.model.get_tensors(self.params[0])] + [self.params[1]]
 
         return loss

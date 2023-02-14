@@ -1,39 +1,32 @@
+import math
 import sys
 import os
 import random
 import time
-import math
 from itertools import count
-
-# import wandb
+import pickle as pkl
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 # mpl.rcParams['agg.path.chunksize'] = 100000
-import pickle as pkl
-
-import jax
-# import jax.config
-# jax.config.update("jax_enable_x64", True)
 
 sys.path.append('../environment/')
 import env as environment
 
 # @profile
 def memory_init(env, agent, eps=1.0):
-    """ Fills replay buffer by taking random actions """
-    state, goal = env.reset()
+    """ Fills replay buffer by taking random actions"""
+    state, _ = env.reset()
     for i in range(agent.replay_buffer.max_size):
-        action = agent.get_action(state, goal, eps=eps)
-        next_state, reward, done, _, _, goal = env.step(action)
-        agent.replay_buffer.push(state, action, reward, next_state, done, goal)
+        action = agent.get_action(state, eps=eps)
+        next_state, reward, done, _, _, _ = env.step(action)
+        agent.replay_buffer.push(state, action, reward, next_state, done)
         state = next_state
         if done:
-            state, goal = env.reset()
-
+            state, _ = env.reset()
 
 # @profile
-def train(env, agent, n_episodes, batch_size, eps_init, eps_final, eps_decay, target_update, update_frequency: int=1, save_model: str="model"):
+def train(env, agent, n_episodes, batch_size, eps_init, eps_final, eps_decay, target_update, update_frequency=1, save_model="model"):
     """
     Training of the QMPS agent
 
@@ -57,121 +50,85 @@ def train(env, agent, n_episodes, batch_size, eps_init, eps_final, eps_decay, ta
         save_model:     string
                         path and filename for saving trained model
     Returns:
-        output:         (episode_rewards, epsilon, losses, trunc_errs, norms, entropies, episode_steps, returns)
+        output:         (episode_rewards, epsilon, losses, trunc_errs, entropies, episode_steps, returns)
                         information saved during training
     """
-    episode_rewards, episode_steps, returns = [], [], []
-    epsilon = []
-    losses = []
-    trunc_errs = []
-    norms = []
-    entropies = []
-    eps = eps_init
+    trunc_errs, entropies, rewards, returns, episode_steps, epsilon, losses = [], [], [], [], [], [], []
 
-    if env.library == environment.Library.TN:
-        print("\nInitial norm: ", agent.norm())
-
-    max_reward = -10000
     start_time = time.time()
     memory_init(env, agent, eps=eps_init)
-    # memory_init(env, agent, eps=1.0)
     print("\n\nDone filling replay buffer: --- {:.4f} seconds ---".format(time.time() - start_time))
 
-    j, k = 0, 0 # counts total number of env transitions, total number of network update steps
+    n_steps, n_updates = 0, 0
     start_time = time.time()
     for episode in range(n_episodes):
-        state, goal = env.reset()
-        init_state = state
-        actions = []
-        episode_reward = 0
-
+        state, _ = env.reset()
+        episode_return = 0
         eps = eps_final + (eps_init - eps_final) * math.exp(-1. * episode / eps_decay)
 
-        i = 0 # counts number of steps per episode
         for step in count():
-            j += 1
+            n_steps += 1
+            action = agent.get_action(state, eps=eps)
 
-            action = agent.get_action(state, goal, eps=eps)
-            actions.append(action)
-
-            if j % update_frequency == 0:
+            if n_steps % update_frequency == 0:
                 loss = agent.update(batch_size)
                 losses.append(loss)
-                k += 1
+                n_updates += 1
 
                 # target network update
-                if not agent.polyak:
-                    if k % target_update == 0:
-                        if env.library == environment.Library.TN:
-                            agent.target_params = agent.get_params(agent.opt_state).copy()
-                        # else:
-                        #     agent.target_model.load_state_dict(agent.model.state_dict())
+                if n_updates % target_update == 0:
+                    if env.library == environment.Library.TN:
+                        agent.target_tensors = agent.tensors.copy()
 
-            next_state, reward, done, trunc_err, entropy, goal = env.step(action)
-            agent.replay_buffer.push(state, action, reward, next_state, done, goal)
-            episode_reward += reward
+            next_state, reward, done, trunc_err, entropy, _ = env.step(action)
+            agent.replay_buffer.push(state, action, reward, next_state, done)
+            episode_return += reward
 
             trunc_errs.append(trunc_err)
-            i += 1
-
             if done:
                 entropies.append(entropy)
-                episode_rewards.append(reward)
-                returns.append(episode_reward)
-                episode_steps.append(i)
-                i = 0
+                rewards.append(reward)
+                returns.append(episode_return)
+                episode_steps.append(step+1)
                 epsilon.append(eps)
-                if reward > max_reward:
-                    max_reward = reward
-                    best_policy = actions
 
                 if episode % 1 == 0:
                     print("\nFinal reward {}: {:.6f}".format(episode, reward))
-                    print("Elapsed time: {:.6f}".format(time.time() - start_time))
-                    # if env.library == environment.Library.TN: norms.append(agent.norm())
+                    print("Number steps {}: {}".format(episode, step))
+                    print("Elapsed time: {:.4f}".format(time.time() - start_time))
                     start_time = time.time()
-                break
 
+                break
             state = next_state
 
     if env.library == environment.Library.TN:
         with open(save_model+".pkl", 'wb') as handle:
-            pkl.dump(agent.get_params(agent.opt_state), handle)
+            if agent.fixed:
+                pkl.dump([agent.model.params[0]] + [agent.get_params(agent.opt_state)], handle)
+            else:
+                pkl.dump(agent.get_params(agent.opt_state), handle)
 
-    # print("Max reward: ", max_reward)
-    # print("Best policy: ", np.array(best_policy))
-
-    np.save(save_model+".npy", best_policy)
-
-    episode_rewards.append(max_reward)
-    returns.append(max_reward)
-
-    return episode_rewards, epsilon, losses, trunc_errs, norms, entropies, episode_steps, returns
+    return rewards, epsilon, losses, trunc_errs, entropies, episode_steps, returns
 
 def run_env(env, agent, n_episodes=1, verbose=True, theta=0, phi=0, testing=True):
     """ Runs environment for n_episodes with greedy action selection """
-    episode_rewards = []
-    actions = []
-
     for episode in range(n_episodes):
-        state, goal = env.reset(theta=theta, phi=phi, testing=testing)
+        state, _ = env.reset(theta=theta, phi=phi, testing=testing)
         if verbose: print("\n -----New episode")
-        episode_reward = 0
+        episode_return = 0
         for step in count():
-            action = agent.get_action(state, goal)
+            action, _ = agent.get_action(state)
             actions.append(action)
             if verbose: print(f"Action {step}: {action}")
             next_state, reward, done, _, _, _ = env.step(action)
-            episode_reward += reward
-            # print(reward)
+            episode_return += reward
 
             if done:
-                episode_rewards.append(episode_reward)
-                if verbose: print("Episode {}: {:.4f}".format(episode, episode_reward))
+                if verbose: print("Episode {}: {:.4f}".format(episode, reward))
                 break
             state = next_state
 
-    return episode_rewards[0], reward, step+1, actions
+    return episode_return, reward, step+1, actions
 
 
 def plot_rewards(reward, epsilon, string, dir="plots/"):
