@@ -20,12 +20,16 @@ __RL environment__
 * [environment/tlfi_tn.py](environment/tlfi_tn.py): Functions for simulating a spin chain. In this case the transverse longitudinal field Ising (TLFI) model.
 * [environment/tlfi_tn_model.py](environment/tlfi_tn_model.py): MPO implementation of the TLFI Hamiltonian
 
+__Tutorials__
+* [dqn/main.ipynb](dqn/main.ipynb): Tutorial demonstrating how to train a QMPS agent.
+* [dqn/test_trained_agent.ipynb](dqn/test_trained_agent.ipynb): Tutorial demonstrating how to test a successfully trained agent on different initial states.
+
 [trained_models/](trained_models/) contains the corresponding data of the control studies presented in the paper (including the optimized QMPS parameters).
 
 ## Requirements
-The code is written in Python and apart from the usual libraries (numpy [tested on v1.21.2], scipy [v1.4.1], matplotlib [v3.1.3]) you need to have the following packages installed:
+The code is written in Python and apart from the usual libraries (numpy [tested on v1.22.3], scipy [v1.8.0], matplotlib [v3.5.1]) you need to have the following packages installed:
 
-* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on jax v0.2.22, jaxlib v0.1.72)
+* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on jax v0.3.24 and v0.4.3)
 * [TensorNetwork](https://github.com/google/TensorNetwork): For the spin chain simulations. (tested on v0.4.6)
 
 ## Run the code
