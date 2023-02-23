@@ -29,7 +29,7 @@ __Tutorials__
 ## Requirements
 The code is written in Python and apart from the usual libraries (numpy [tested on v1.22.3], scipy [v1.8.0], matplotlib [v3.5.1]) you need to have the following packages installed:
 
-* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on jax v0.3.24 and v0.4.3)
+* [JAX](https://github.com/google/jax): For performance enhancenment via just-in-time compilation. (tested on jax/jaxlib v0.3.24 and v0.4.3)
 * [TensorNetwork](https://github.com/google/TensorNetwork): For the spin chain simulations. (tested on v0.4.6)
 
 ## Run the code
