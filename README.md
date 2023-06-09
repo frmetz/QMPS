@@ -26,6 +26,8 @@ __Tutorials__
 
 [trained_models/](trained_models/) contains the corresponding data of the control studies presented in the paper (including the optimized QMPS parameters).
 
+[figures/](figures/) contains the data used for generating the main plots in the paper and python scripts for reproducing them.
+
 ## Requirements
 The code is written in Python and apart from the usual libraries (numpy [tested on v1.22.3], scipy [v1.8.0], matplotlib [v3.5.1]) you need to have the following packages installed:
 
