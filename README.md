@@ -1,6 +1,6 @@
 # Self-Correcting Quantum Many-Body Control using Reinforcement Learning with Tensor Networks
 
-This repository contains the code and data for the corresponding preprint article [arXiv:2409.06415](https://arxiv.org/abs/2409.06415).
+This repository contains the code and data for the corresponding preprint article [arXiv:2201.11790](https://arxiv.org/abs/2201.11790).
 
 ## Summary
 
